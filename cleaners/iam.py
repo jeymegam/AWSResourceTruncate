@@ -1,6 +1,15 @@
-"""IAM cleaner - deletes roles, policies, users, and instance profiles."""
+"""IAM cleaner - deletes roles, policies, users, and instance profiles.
+
+Respects exclusions defined in exclusions.py to protect shared infrastructure.
+"""
 
 from cleaners.base import BaseCleaner
+from exclusions import (
+    EXCLUDED_IAM_ROLES,
+    EXCLUDED_INLINE_POLICIES,
+    EXCLUDED_IAM_USERS,
+    EXCLUDED_USER_POLICIES,
+)
 
 # Prefixes for AWS-managed roles that should never be deleted
 PROTECTED_PREFIXES = (
@@ -26,14 +35,25 @@ class IAMCleaner(BaseCleaner):
         """Check if a role/resource name is AWS-managed and should be skipped."""
         return any(name.startswith(prefix) for prefix in PROTECTED_PREFIXES)
 
+    def _is_excluded_role(self, role_name):
+        """Check if a role is in the exclusion list."""
+        return role_name in EXCLUDED_IAM_ROLES
+
+    def _is_excluded_user(self, user_name):
+        """Check if a user is in the exclusion list."""
+        return user_name in EXCLUDED_IAM_USERS
+
     def _delete_roles(self, client):
-        """Delete all non-AWS-managed IAM roles."""
+        """Delete all non-AWS-managed IAM roles, respecting exclusions."""
         paginator = client.get_paginator("list_roles")
         for page in paginator.paginate():
             for role in page["Roles"]:
                 role_name = role["RoleName"]
                 if self._is_protected(role_name):
                     self.log_skip("IAM Role", role_name, "AWS-managed")
+                    continue
+                if self._is_excluded_role(role_name):
+                    self.log_skip("IAM Role", role_name, "excluded (shared infrastructure)")
                     continue
                 # Check if it's a service-linked role
                 if role.get("Path", "").startswith("/aws-service-role/"):
@@ -90,14 +110,33 @@ class IAMCleaner(BaseCleaner):
                 policy_arn = policy["Arn"]
                 policy_name = policy["PolicyName"]
                 try:
-                    # Detach from all entities
+                    # Detach from all entities, but skip excluded user+policy combos
                     entities = client.list_entities_for_policy(PolicyArn=policy_arn)
                     for role in entities.get("PolicyRoles", []):
+                        # Don't detach policies from excluded roles
+                        if role["RoleName"] in EXCLUDED_IAM_ROLES:
+                            self.log_skip(
+                                "Policy detach",
+                                f"{policy_name} from {role['RoleName']}",
+                                "excluded role",
+                            )
+                            continue
                         if not self.dry_run:
                             client.detach_role_policy(
                                 RoleName=role["RoleName"], PolicyArn=policy_arn
                             )
                     for user in entities.get("PolicyUsers", []):
+                        # Don't detach excluded policies from excluded users
+                        user_excluded_policies = EXCLUDED_USER_POLICIES.get(
+                            user["UserName"], []
+                        )
+                        if policy_arn in user_excluded_policies:
+                            self.log_skip(
+                                "Policy detach",
+                                f"{policy_name} from user {user['UserName']}",
+                                "excluded user policy",
+                            )
+                            continue
                         if not self.dry_run:
                             client.detach_user_policy(
                                 UserName=user["UserName"], PolicyArn=policy_arn
@@ -126,7 +165,7 @@ class IAMCleaner(BaseCleaner):
                     self.log_error(f"Could not delete policy {policy_name}", e)
 
     def _delete_users(self, client):
-        """Delete all IAM users (except the current caller)."""
+        """Delete all IAM users (except current caller and excluded users)."""
         sts = self.get_client("sts")
         current_arn = sts.get_caller_identity()["Arn"]
 
@@ -137,6 +176,12 @@ class IAMCleaner(BaseCleaner):
                 # Don't delete the user running this script
                 if user_name in current_arn:
                     self.log_skip("IAM User", user_name, "current caller")
+                    continue
+                # Don't delete excluded users
+                if self._is_excluded_user(user_name):
+                    self.log_skip(
+                        "IAM User", user_name, "excluded (shared infrastructure)"
+                    )
                     continue
                 self._delete_single_user(client, user_name)
 
@@ -160,11 +205,19 @@ class IAMCleaner(BaseCleaner):
             except client.exceptions.NoSuchEntityException:
                 pass
 
-            # Detach policies
+            # Detach policies (respecting exclusions)
             attached = client.list_attached_user_policies(UserName=user_name).get(
                 "AttachedPolicies", []
             )
+            user_excluded_policies = EXCLUDED_USER_POLICIES.get(user_name, [])
             for policy in attached:
+                if policy["PolicyArn"] in user_excluded_policies:
+                    self.log_skip(
+                        "Policy detach",
+                        f"{policy['PolicyName']} from {user_name}",
+                        "excluded user policy",
+                    )
+                    continue
                 if not self.dry_run:
                     client.detach_user_policy(
                         UserName=user_name, PolicyArn=policy["PolicyArn"]
@@ -205,12 +258,21 @@ class IAMCleaner(BaseCleaner):
             self.log_error(f"Could not delete user {user_name}", e)
 
     def _delete_instance_profiles(self, client):
-        """Delete all instance profiles."""
+        """Delete all instance profiles (skipping those tied to excluded roles)."""
         paginator = client.get_paginator("list_instance_profiles")
         for page in paginator.paginate():
             for profile in page["InstanceProfiles"]:
                 profile_name = profile["InstanceProfileName"]
                 if self._is_protected(profile_name):
+                    continue
+                # Skip instance profiles that contain excluded roles
+                profile_roles = [r["RoleName"] for r in profile.get("Roles", [])]
+                if any(r in EXCLUDED_IAM_ROLES for r in profile_roles):
+                    self.log_skip(
+                        "Instance Profile",
+                        profile_name,
+                        "contains excluded role",
+                    )
                     continue
                 try:
                     # Remove all roles first

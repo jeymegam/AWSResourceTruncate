@@ -1,6 +1,10 @@
-"""Lambda cleaner - deletes all Lambda functions and layers."""
+"""Lambda cleaner - deletes all Lambda functions and layers.
+
+Respects exclusions: functions using excluded IAM roles are skipped.
+"""
 
 from cleaners.base import BaseCleaner
+from exclusions import EXCLUDED_IAM_ROLES
 
 
 class LambdaCleaner(BaseCleaner):
@@ -14,11 +18,23 @@ class LambdaCleaner(BaseCleaner):
         self._delete_event_source_mappings(client)
 
     def _delete_functions(self, client):
-        """Delete all Lambda functions."""
+        """Delete all Lambda functions, skipping those using excluded roles."""
         paginator = client.get_paginator("list_functions")
         for page in paginator.paginate():
             for func in page.get("Functions", []):
                 func_name = func["FunctionName"]
+                func_role = func.get("Role", "")
+
+                # Skip functions that use an excluded IAM role
+                role_name = func_role.split("/")[-1] if "/" in func_role else ""
+                if role_name in EXCLUDED_IAM_ROLES:
+                    self.log_skip(
+                        "Lambda Function",
+                        func_name,
+                        f"uses excluded role {role_name}",
+                    )
+                    continue
+
                 try:
                     if not self.dry_run:
                         client.delete_function(FunctionName=func_name)

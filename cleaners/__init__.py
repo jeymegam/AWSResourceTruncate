@@ -4,6 +4,7 @@ from cleaners.ec2 import EC2Cleaner
 from cleaners.s3 import S3Cleaner
 from cleaners.s3_tables import S3TablesCleaner
 from cleaners.iam import IAMCleaner
+from cleaners.kms import KMSCleaner
 from cleaners.dynamodb import DynamoDBCleaner
 from cleaners.glue import GlueCleaner
 from cleaners.athena import AthenaCleaner
@@ -29,5 +30,6 @@ ALL_CLEANERS = [
     SNSCleaner,
     SQSCleaner,
     CloudWatchCleaner,
+    KMSCleaner,
     IAMCleaner,
 ]

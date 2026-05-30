@@ -32,6 +32,7 @@ SERVICE_MAP = {
     "sns": "SNSCleaner",
     "sqs": "SQSCleaner",
     "cloudwatch": "CloudWatchCleaner",
+    "kms": "KMSCleaner",
     "iam": "IAMCleaner",
 }
 
