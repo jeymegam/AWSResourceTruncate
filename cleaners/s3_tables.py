@@ -1,4 +1,8 @@
-"""S3 Tables cleaner - deletes S3 table buckets, namespaces, and tables."""
+"""S3 Tables cleaner - deletes S3 table buckets, namespaces, tables, AND underlying data.
+
+The S3 Tables API only removes table metadata. The actual data (Iceberg/Parquet files)
+is stored in a backing S3 bucket that must be emptied separately.
+"""
 
 from cleaners.base import BaseCleaner
 
@@ -28,6 +32,9 @@ class S3TablesCleaner(BaseCleaner):
             tb_arn = tb["arn"]
             tb_name = tb["name"]
             self._delete_table_bucket(client, tb_arn, tb_name)
+
+        # Clean up underlying S3 data buckets used by S3 Tables
+        self._delete_table_data_buckets()
 
     def _delete_table_bucket(self, client, tb_arn, tb_name):
         """Delete all tables, namespaces, then the table bucket itself."""
@@ -64,3 +71,45 @@ class S3TablesCleaner(BaseCleaner):
                     tableBucketARN=tb_arn, namespace=ns_name, name=table_name
                 )
             self.log_delete("S3 Table", f"{ns_name}.{table_name}")
+
+    def _delete_table_data_buckets(self):
+        """Delete S3 buckets that store the underlying table data.
+
+        S3 Tables stores actual data (Iceberg metadata + Parquet files) in
+        backing S3 buckets. These typically have prefixes like:
+        - s3tablescatalog-* (managed by S3 Tables service)
+        - Buckets with 's3-tables' or 'table-bucket' in the name
+
+        This method finds and empties those buckets.
+        """
+        s3_client = self.get_client("s3")
+        s3_resource = self.get_resource("s3")
+
+        # Patterns that identify S3 Tables data buckets
+        table_data_prefixes = (
+            "s3tablescatalog-",
+            "s3-tables-",
+            "table-bucket-",
+        )
+
+        try:
+            buckets = s3_client.list_buckets().get("Buckets", [])
+            for bucket in buckets:
+                bucket_name = bucket["Name"]
+                # Check if this is a table data bucket
+                if any(bucket_name.startswith(p) for p in table_data_prefixes):
+                    self._empty_and_delete_bucket(s3_client, s3_resource, bucket_name)
+        except Exception as e:
+            self.log_error("Could not clean S3 Tables data buckets", e)
+
+    def _empty_and_delete_bucket(self, s3_client, s3_resource, bucket_name):
+        """Empty all objects/versions and delete the bucket."""
+        try:
+            bucket = s3_resource.Bucket(bucket_name)
+            if not self.dry_run:
+                bucket.object_versions.all().delete()
+                bucket.objects.all().delete()
+                s3_client.delete_bucket(Bucket=bucket_name)
+            self.log_delete("S3 Tables Data Bucket", bucket_name)
+        except Exception as e:
+            self.log_error(f"Could not delete table data bucket {bucket_name}", e)
